@@ -1,98 +1,123 @@
-from fastapi import FastAPI, HTTPException
+import os
+import json
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-import re
+import pypdf
+from groq import Groq
+from dotenv import load_dotenv
 
-app = FastAPI(title="Smart Resume Screening API")
+# Load environment variables
+load_dotenv()
 
-class ResumeInput(BaseModel):
-    id: str
-    text: str
+app = FastAPI(title="AI Resume Screening API (Phase 2)")
 
-class MatchRequest(BaseModel):
-    job_description: str
-    required_skills: List[str] = [] # Made optional
-    resumes: List[ResumeInput]
+# Allow React frontend to communicate with this API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # In production, replace "*" with your React app's Render URL
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize Groq Client
+client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 class MatchResult(BaseModel):
     resume_id: str
-    score: float
-    matched_skills: List[str] = []
-    missing_skills: List[str] = []
+    score: int
+    matched_skills: List[str]
+    missing_skills: List[str]
     explanation: str
 
-# A robust dictionary of common technical skills for auto-extraction
-SKILLS_DICTIONARY = [
-    "Python", "Java", "C++", "JavaScript", "TypeScript", "Go", "Rust", "Ruby", "PHP",
-    "FastAPI", "Flask", "Django", "Node.js", "Express", "React", "Angular", "Vue",
-    "AWS", "Azure", "GCP", "Docker", "Kubernetes", "CI/CD", "DevOps", "Git",
-    "SQL", "MySQL", "PostgreSQL", "MongoDB", "Redis", "Firebase", "Oracle",
-    "Machine Learning", "Deep Learning", "NLP", "Data Science", "Pandas", "NumPy",
-    "HTML", "CSS", "Tailwind", "Bootstrap", "GraphQL", "REST API", "Microservices", "Zoho", "Power Platform"
-]
+def extract_text_from_pdf(file_obj) -> str:
+    """Helper to parse text from a PDF file object."""
+    try:
+        reader = pypdf.PdfReader(file_obj)
+        text = "".join([page.extract_text() + "\n" for page in reader.pages if page.extract_text()])
+        return text
+    except Exception as e:
+        print(f"PDF Error: {e}")
+        return ""
 
-def auto_extract_skills(text: str) -> List[str]:
-    """Scans text against the SKILLS_DICTIONARY using word boundaries."""
-    found_skills = []
-    for skill in SKILLS_DICTIONARY:
-        # Using regex to match whole words and ignore case (e.g., 'Go' won't match 'google')
-        pattern = r'\b' + re.escape(skill.lower()) + r'\b'
-        if re.search(pattern, text.lower()):
-            found_skills.append(skill)
-    return found_skills
+def evaluate_with_llm(jd_text: str, resume_text: str) -> dict:
+    """Uses Groq Llama 3 to evaluate the resume and returns a JSON object."""
+    prompt = f"""
+    You are an expert AI technical recruiter. Evaluate the candidate's Resume against the Job Description.
+    Analyze hard skills, experience context, and overall fit.
 
-def extract_skills(text: str, required_skills: List[str]):
-    text_lower = text.lower()
-    matched = [skill for skill in required_skills if skill.lower() in text_lower]
-    missing = [skill for skill in required_skills if skill.lower() not in text_lower]
-    return matched, missing
+    Job Description:
+    {jd_text}
+
+    Resume:
+    {resume_text}
+
+    You MUST respond in valid JSON format exactly matching this structure:
+    {{
+        "score": (integer 0-100 based on overall fit),
+        "matched_skills": [(list of key skills found in BOTH)],
+        "missing_skills": [(list of important JD skills missing from the resume)],
+        "explanation": "(2-3 sentences explaining your reasoning)"
+    }}
+    """
+
+    try:
+        chat_completion = client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model="llama-3.3-70b-versatile",
+            response_format={"type": "json_object"},
+            temperature=0.2, # Low temperature for consistent logic
+        )
+        return json.loads(chat_completion.choices[0].message.content)
+    except Exception as e:
+        print(f"Groq API Error: {e}")
+        return {
+            "score": 0,
+            "matched_skills": [],
+            "missing_skills": [],
+            "explanation": "Failed to evaluate due to API error."
+        }
 
 @app.post("/match", response_model=List[MatchResult])
-async def match_resumes(request: MatchRequest):
-    if not request.resumes:
-        raise HTTPException(status_code=400, detail="No resumes provided.")
+async def match_resumes(
+    job_description: str = Form(""), 
+    jd_file: UploadFile = File(None), 
+    resumes: List[UploadFile] = File(...)
+):
+    if not resumes:
+        raise HTTPException(status_code=400, detail="No resumes uploaded.")
 
-    # Auto-extract skills from JD if none were manually specified
-    target_skills = request.required_skills
-    if not target_skills:
-        target_skills = auto_extract_skills(request.job_description)
-    
-    # If still no skills found, fallback to generic evaluation
-    documents = [request.job_description] + [r.text for r in request.resumes]
-    
-    vectorizer = TfidfVectorizer(stop_words='english')
-    try:
-        tfidf_matrix = vectorizer.fit_transform(documents)
-        cosine_similarities = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:]).flatten()
-    except ValueError:
-        cosine_similarities = [0.0] * len(request.resumes)
+    # 1. Handle JD PDF Upload if provided
+    final_jd_text = job_description
+    if jd_file and jd_file.filename:
+        final_jd_text = extract_text_from_pdf(jd_file.file)
+        
+    if not final_jd_text.strip():
+        raise HTTPException(status_code=400, detail="Please provide a Job Description via text or PDF.")
 
     results = []
-    for idx, resume in enumerate(request.resumes):
-        matched, missing = extract_skills(resume.text, target_skills)
+    
+    # 2. Process Resumes
+    for resume in resumes:
+        if not resume.filename.endswith('.pdf'):
+            continue
+            
+        resume_text = extract_text_from_pdf(resume.file)
+        if not resume_text.strip():
+            continue
+            
+        # Call Groq LLM
+        llm_response = evaluate_with_llm(final_jd_text, resume_text)
         
-        text_score = max(0, min(100, cosine_similarities[idx] * 100))
-        skill_score = (len(matched) / len(target_skills) * 100) if target_skills else text_score
-        
-        # 60% weight to matched skills, 40% weight to contextual similarity
-        final_score = round((0.6 * skill_score) + (0.4 * text_score), 2)
-        
-        if final_score >= 75:
-            expl = f"Strong match. Contains {len(matched)} key skills and aligns well with the JD context."
-        elif final_score >= 50:
-            expl = f"Moderate match. Shares contextual background but is missing critical skills like: {', '.join(missing[:2])}."
-        else:
-            expl = f"Weak match. Core skills are missing and semantic alignment is low."
-
         results.append(MatchResult(
-            resume_id=resume.id,
-            score=final_score,
-            matched_skills=matched,
-            missing_skills=missing,
-            explanation=expl
+            resume_id=resume.filename,
+            score=llm_response.get("score", 0),
+            matched_skills=llm_response.get("matched_skills", []),
+            missing_skills=llm_response.get("missing_skills", []),
+            explanation=llm_response.get("explanation", "No explanation provided.")
         ))
-        
+
     results.sort(key=lambda x: x.score, reverse=True)
     return results
